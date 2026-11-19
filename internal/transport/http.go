@@ -63,6 +63,32 @@ func (a API) Handler() http.Handler {
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		jsonOut(w, 200, map[string]string{"service": "prism-plate", "state": "ready"})
 	})
+	mux.HandleFunc("POST /v1/fonts", func(w http.ResponseWriter, r *http.Request) {
+		var q struct {
+			ID   string `json:"id"`
+			Data []byte `json:"data"`
+		}
+		if e := decode(w, r, &q); e != nil {
+			failure(w, e)
+			return
+		}
+		v, e := a.Service.AddFont(q.ID, q.Data)
+		if e != nil {
+			failure(w, e)
+			return
+		}
+		v.Data = nil
+		jsonOut(w, 201, v)
+	})
+	mux.HandleFunc("GET /v1/fonts/{id}", func(w http.ResponseWriter, r *http.Request) {
+		v, e := a.Service.Font(r.PathValue("id"))
+		if e != nil {
+			failure(w, e)
+			return
+		}
+		v.Data = nil
+		jsonOut(w, 200, v)
+	})
 	mux.HandleFunc("POST /v1/plates", func(w http.ResponseWriter, r *http.Request) {
 		var q struct {
 			ID       string         `json:"id"`

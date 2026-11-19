@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"prismplate/internal/font"
 	"prismplate/internal/repository"
 	"prismplate/internal/service"
 	"prismplate/internal/transport"
@@ -30,10 +31,20 @@ func run() error {
 		return err
 	}
 	defer repo.Close()
-	// A checksum proves identity, not semantic validity. Recompile recovered scenes.
-	for _, p := range repo.View().Plates {
+	// A checksum proves identity, not semantic validity. Recompile recovered
+	// scenes against the persisted font inventory through the same admission.
+	st := repo.View()
+	blobs := make(map[string][]byte, len(st.Fonts))
+	for id, f := range st.Fonts {
+		blobs[id] = f.Data
+	}
+	set, err := font.ParseAll(blobs)
+	if err != nil {
+		return err
+	}
+	for _, p := range st.Plates {
 		for _, r := range p.Revisions {
-			if _, err = validate.Compile(r.Document); err != nil {
+			if _, err = validate.Compile(r.Document, set); err != nil {
 				return err
 			}
 		}

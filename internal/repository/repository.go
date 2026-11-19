@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"prismplate/internal/font"
 	"prismplate/internal/scene"
 	"sync"
 	"time"
@@ -46,11 +47,26 @@ type Proof struct {
 	State    string `json:"state"`
 	Note     string `json:"note"`
 }
+
+// Font is an immutable uploaded font. Data bytes are pinned by Digest; the
+// family/license/glyph metadata is derived from the bytes at upload or import
+// time and records what the font declares, not a legal verification.
+type Font struct {
+	ID         string    `json:"id"`
+	Digest     string    `json:"digest"`
+	Family     string    `json:"family"`
+	License    string    `json:"license"`
+	Glyphs     int       `json:"glyphs"`
+	UnitsPerEm int       `json:"units_per_em"`
+	Created    time.Time `json:"created"`
+	Data       []byte    `json:"data"`
+}
 type State struct {
 	Schema    string              `json:"schema"`
 	Plates    map[string]Plate    `json:"plates"`
 	Artifacts map[string]Artifact `json:"artifacts"`
 	Proofs    map[string]Proof    `json:"proofs"`
+	Fonts     map[string]Font     `json:"fonts"`
 }
 type Repo struct {
 	mu    sync.RWMutex
@@ -62,7 +78,7 @@ type Repo struct {
 func Hash(b []byte) string              { v := sha256.Sum256(b); return hex.EncodeToString(v[:]) }
 func SceneHash(d scene.Document) string { b, _ := json.Marshal(d); return Hash(b) }
 func Fresh() State {
-	return State{Schema: "prism-plate-v1", Plates: map[string]Plate{}, Artifacts: map[string]Artifact{}, Proofs: map[string]Proof{}}
+	return State{Schema: "prism-plate-v1", Plates: map[string]Plate{}, Artifacts: map[string]Artifact{}, Proofs: map[string]Proof{}, Fonts: map[string]Font{}}
 }
 func Open(root string) (*Repo, error) {
 	if err := os.MkdirAll(root, 0700); err != nil {
@@ -81,6 +97,9 @@ func Open(root string) (*Repo, error) {
 		} else {
 			err = json.Unmarshal(b, &r.state)
 		}
+		if err == nil && r.state.Fonts == nil {
+			r.state.Fonts = map[string]Font{} // snapshots predate fonts
+		}
 		if err == nil {
 			err = Check(r.state)
 		}
@@ -97,6 +116,11 @@ func Check(s State) error {
 	if s.Schema != "prism-plate-v1" || s.Plates == nil || s.Artifacts == nil || s.Proofs == nil {
 		return fmt.Errorf("unsupported snapshot schema")
 	}
+	for id, f := range s.Fonts {
+		if f.ID != id || len(f.Data) == 0 || len(f.Data) > font.MaxBytes || Hash(f.Data) != f.Digest {
+			return fmt.Errorf("invalid font lineage")
+		}
+	}
 	for id, p := range s.Plates {
 		if p.ID != id || len(p.Revisions) == 0 || (p.State != "active" && p.State != "archived") {
 			return fmt.Errorf("invalid plate lineage")
@@ -104,6 +128,13 @@ func Check(s State) error {
 		for i, r := range p.Revisions {
 			if r.Number != i+1 || r.Digest != SceneHash(r.Document) {
 				return fmt.Errorf("invalid revision digest")
+			}
+			for _, l := range r.Document.Layers {
+				for _, t := range l.Texts {
+					if _, ok := s.Fonts[t.Font]; !ok {
+						return fmt.Errorf("text references unknown font")
+					}
+				}
 			}
 		}
 	}
@@ -139,7 +170,7 @@ func (r *Repo) Update(fn func(*State) error) error {
 	if err := Check(next); err != nil {
 		return err
 	}
-	if len(next.Plates) > 128 || len(next.Artifacts) > 256 || len(next.Proofs) > 1024 {
+	if len(next.Plates) > 128 || len(next.Artifacts) > 256 || len(next.Proofs) > 1024 || len(next.Fonts) > 32 {
 		return fmt.Errorf("snapshot object capacity reached")
 	}
 	b, err := json.Marshal(next)

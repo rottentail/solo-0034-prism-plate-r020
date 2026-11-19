@@ -13,6 +13,11 @@
       "path": "internal/geom"
     },
     {
+      "id": "font",
+      "name": "字体解析与排版",
+      "path": "internal/font"
+    },
+    {
       "id": "validate",
       "name": "准入与预算",
       "path": "internal/validate"
@@ -314,6 +319,47 @@
       "success": "非法场景不占历史，已有图仍可生成",
       "failure": "过量画布或错误渐变400",
       "verification": "python3 scripts/walkthrough.py --workflow rejection"
+    },
+    {
+      "id": "text",
+      "name": "文字对象与字体",
+      "entry": "POST /v1/fonts → 文字稿本 → PNG/SVG",
+      "module_ids": [
+        "transport",
+        "service",
+        "font",
+        "validate",
+        "raster",
+        "vector",
+        "repository"
+      ],
+      "steps": [
+        "从公开入口解析并获取固定来源",
+        "跨职责计算或判定并提交完整结果"
+      ],
+      "success": "字距/内孔/旋转缩放稳定，缺失字形定位，文字可修订",
+      "failure": "非法字体、缺失字形、摘要钉不符400",
+      "verification": "python3 scripts/walkthrough.py --workflow text"
+    },
+    {
+      "id": "textbundle",
+      "name": "字体封包零漂移",
+      "entry": "GET bundle → 新服务导入 → 渲染比对",
+      "module_ids": [
+        "transport",
+        "service",
+        "bundle",
+        "font",
+        "validate",
+        "repository"
+      ],
+      "steps": [
+        "从公开入口解析并获取固定来源",
+        "跨职责计算或判定并提交完整结果"
+      ],
+      "success": "封包携带字体，跨服务渲染摘要逐字节一致",
+      "failure": "字体篡改400，同标识不同摘要409",
+      "verification": "python3 scripts/walkthrough.py --workflow textbundle"
     }
   ],
   "complexity": {

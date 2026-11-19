@@ -6,11 +6,13 @@ import (
 	"fmt"
 	"prismplate/internal/bundle"
 	"prismplate/internal/exposure"
+	"prismplate/internal/font"
 	"prismplate/internal/raster"
 	"prismplate/internal/repository"
 	"prismplate/internal/scene"
 	"prismplate/internal/validate"
 	"prismplate/internal/vector"
+	"sort"
 	"strconv"
 	"time"
 )
@@ -25,15 +27,59 @@ func New(r *repository.Repo) *Service {
 	return &Service{Repo: r, Pool: exposure.New(2, 8), slots: make(chan struct{}, 2)}
 }
 func (s *Service) Close() { s.Pool.Close() }
+
+// fonts parses the current font inventory for one compilation pass. Uploaded
+// fonts are immutable, so a parsed set is a complete and consistent view.
+func (s *Service) fonts() (font.Set, error) {
+	st := s.Repo.View()
+	blobs := make(map[string][]byte, len(st.Fonts))
+	for id, f := range st.Fonts {
+		blobs[id] = f.Data
+	}
+	return font.ParseAll(blobs)
+}
+
+// AddFont admits one uploaded open-license font. Fonts are immutable: the same
+// identity can never be rebound to different bytes, so a text's font reference
+// resolves identically on any service that accepted it.
+func (s *Service) AddFont(id string, data []byte) (repository.Font, error) {
+	if !validate.ID(id) {
+		return repository.Font{}, fmt.Errorf("invalid font identity")
+	}
+	face, err := font.Parse(data)
+	if err != nil {
+		return repository.Font{}, err
+	}
+	rec := repository.Font{ID: id, Digest: repository.Hash(data), Family: face.Family(), License: face.License(), Glyphs: face.NumGlyphs(), UnitsPerEm: face.UnitsPerEm(), Created: time.Now().UTC(), Data: data}
+	err = s.Repo.Update(func(st *repository.State) error {
+		if _, ok := st.Fonts[id]; ok {
+			return repository.ErrConflict
+		}
+		st.Fonts[id] = rec
+		return nil
+	})
+	return rec, err
+}
+func (s *Service) Font(id string) (repository.Font, error) {
+	f, ok := s.Repo.View().Fonts[id]
+	if !ok {
+		return f, repository.ErrMissing
+	}
+	return f, nil
+}
 func (s *Service) Create(id, title string, d scene.Document) (repository.Plate, error) {
 	if !validate.ID(id) || len(title) == 0 || len(title) > 160 {
 		return repository.Plate{}, fmt.Errorf("invalid plate identity")
 	}
-	if _, err := validate.Compile(d); err != nil {
+	set, err := s.fonts()
+	if err != nil {
+		return repository.Plate{}, err
+	}
+	if _, err := validate.Compile(d, set); err != nil {
 		return repository.Plate{}, err
 	}
 	p := repository.Plate{ID: id, Title: title, State: "active", Revisions: []repository.Revision{{Number: 1, Digest: repository.SceneHash(d), Document: d, Created: time.Now().UTC()}}}
-	err := s.Repo.Update(func(st *repository.State) error {
+	err = s.Repo.Update(func(st *repository.State) error {
 		if _, ok := st.Plates[id]; ok {
 			return repository.ErrConflict
 		}
@@ -50,11 +96,15 @@ func (s *Service) Plate(id string) (repository.Plate, error) {
 	return p, nil
 }
 func (s *Service) Revise(id string, expected int, d scene.Document) (repository.Plate, error) {
-	if _, err := validate.Compile(d); err != nil {
+	set, err := s.fonts()
+	if err != nil {
+		return repository.Plate{}, err
+	}
+	if _, err := validate.Compile(d, set); err != nil {
 		return repository.Plate{}, err
 	}
 	var p repository.Plate
-	err := s.Repo.Update(func(st *repository.State) error {
+	err = s.Repo.Update(func(st *repository.State) error {
 		var ok bool
 		p, ok = st.Plates[id]
 		if !ok {
@@ -116,7 +166,11 @@ func (s *Service) render(ctx context.Context, id string, r repository.Revision, 
 	default:
 		return a, exposure.ErrBusy
 	}
-	c, err := validate.Compile(r.Document)
+	set, err := s.fonts()
+	if err != nil {
+		return a, err
+	}
+	c, err := validate.Compile(r.Document, set)
 	if err != nil {
 		return a, err
 	}
@@ -244,21 +298,55 @@ func (s *Service) Decide(id, state, note string) (repository.Proof, error) {
 	})
 	return p, err
 }
+
+// Export seals the plate history together with every font its revisions
+// reference, sorted for deterministic envelope bytes.
 func (s *Service) Export(id string) ([]byte, error) {
 	p, e := s.Plate(id)
 	if e != nil {
 		return nil, e
 	}
-	return bundle.Seal(p)
+	st := s.Repo.View()
+	refs := map[string]bool{}
+	for _, r := range p.Revisions {
+		for _, l := range r.Document.Layers {
+			for _, t := range l.Texts {
+				refs[t.Font] = true
+			}
+		}
+	}
+	fonts := []repository.Font{}
+	for fid := range refs {
+		f, ok := st.Fonts[fid]
+		if !ok {
+			return nil, fmt.Errorf("referenced font %q missing", fid)
+		}
+		fonts = append(fonts, f)
+	}
+	sort.Slice(fonts, func(i, j int) bool { return fonts[i].ID < fonts[j].ID })
+	return bundle.Seal(p, fonts)
 }
+
+// Import admits a sealed envelope. A bundled font identical to an existing one
+// (same identity and digest) is deduplicated; the same identity pinned to
+// different bytes rejects the whole import rather than risking layout drift.
 func (s *Service) Import(raw []byte) (repository.Plate, error) {
-	p, e := bundle.Open(raw)
+	p, fonts, e := bundle.Open(raw)
 	if e != nil {
 		return p, e
 	}
 	e = s.Repo.Update(func(st *repository.State) error {
 		if _, ok := st.Plates[p.ID]; ok {
 			return repository.ErrConflict
+		}
+		for _, f := range fonts {
+			if old, ok := st.Fonts[f.ID]; ok {
+				if old.Digest != f.Digest {
+					return repository.ErrConflict
+				}
+				continue
+			}
+			st.Fonts[f.ID] = f
 		}
 		st.Plates[p.ID] = p
 		return nil

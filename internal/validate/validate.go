@@ -4,9 +4,11 @@ package validate
 import (
 	"fmt"
 	"math"
+	"prismplate/internal/font"
 	"prismplate/internal/geom"
 	"prismplate/internal/scene"
 	"regexp"
+	"unicode/utf8"
 )
 
 var identifier = regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9_-]{0,63}$`)
@@ -89,7 +91,69 @@ func brush(b scene.Brush) error {
 	}
 	return nil
 }
-func Compile(d scene.Document) (scene.Compiled, error) {
+
+// transform checks a shape or text transform for finiteness and invertibility.
+func transform(m geom.Matrix) (geom.Matrix, error) {
+	for _, v := range m {
+		if !finite(v) {
+			return geom.Matrix{}, fmt.Errorf("invalid transform")
+		}
+	}
+	inv, ok := m.Inverse()
+	if !ok {
+		return geom.Matrix{}, fmt.Errorf("singular transform")
+	}
+	for _, v := range inv {
+		if !finite(v) {
+			return geom.Matrix{}, fmt.Errorf("ill-conditioned transform")
+		}
+	}
+	return inv, nil
+}
+
+// text compiles one editable text object into a resolved, orientation-normalized
+// contour shape. Missing glyphs and font mismatches are admission errors that
+// name the text node so the gap can be located.
+func text(t scene.Text, fonts font.Set) (scene.CompiledShape, geom.Path, error) {
+	var out scene.CompiledShape
+	if n := utf8.RuneCountInString(t.Source); n < 1 || n > 256 {
+		return out, nil, fmt.Errorf("text %q: source must be 1..256 runes", t.ID)
+	}
+	if !finite(t.Size) || t.Size <= 0 || t.Size > 1024 {
+		return out, nil, fmt.Errorf("text %q: invalid size", t.ID)
+	}
+	if !finite(t.LetterSpacing) || math.Abs(t.LetterSpacing) > 256 {
+		return out, nil, fmt.Errorf("text %q: invalid letter spacing", t.ID)
+	}
+	if !finite(t.Origin.X) || !finite(t.Origin.Y) {
+		return out, nil, fmt.Errorf("text %q: invalid origin", t.ID)
+	}
+	inv, err := transform(t.Transform)
+	if err != nil {
+		return out, nil, fmt.Errorf("text %q: %w", t.ID, err)
+	}
+	if err := brush(t.Brush); err != nil {
+		return out, nil, fmt.Errorf("text %q: %w", t.ID, err)
+	}
+	face, ok := fonts[t.Font]
+	if !ok {
+		return out, nil, fmt.Errorf("text %q: unknown font %q", t.ID, t.Font)
+	}
+	if t.FontDigest != "" && t.FontDigest != face.Digest() {
+		return out, nil, fmt.Errorf("text %q: font %q digest mismatch", t.ID, t.Font)
+	}
+	p, err := face.Layout(t.Source, t.Size, t.Origin, t.LetterSpacing)
+	if err != nil {
+		return out, nil, fmt.Errorf("text %q: %w", t.ID, err)
+	}
+	out = scene.CompiledShape{
+		Shape:   scene.Shape{ID: t.ID, FillRule: "nonzero", Brush: t.Brush, Transform: t.Transform},
+		Path:    p,
+		Inverse: inv,
+	}
+	return out, p, nil
+}
+func Compile(d scene.Document, fonts font.Set) (scene.Compiled, error) {
 	c := scene.Compiled{Document: d}
 	if d.Width < 1 || d.Height < 1 || d.Width > 512 || d.Height > 512 || !Color(d.Background) {
 		return c, fmt.Errorf("invalid canvas (maximum 512 square)")
@@ -117,8 +181,8 @@ func Compile(d scene.Document) (scene.Compiled, error) {
 		if !Unit(l.Opacity) || (l.Blend != "normal" && l.Blend != "multiply" && l.Blend != "screen") {
 			return c, fmt.Errorf("invalid layer compositing")
 		}
-		if len(l.Shapes) < 1 || len(l.Shapes) > 32 {
-			return c, fmt.Errorf("requires 1..32 shapes per layer")
+		if n := len(l.Shapes) + len(l.Texts); n < 1 || n > 32 {
+			return c, fmt.Errorf("requires 1..32 shapes and texts per layer")
 		}
 		cl := scene.CompiledLayer{Layer: l}
 		if len(l.Clip) > 0 {
@@ -144,19 +208,9 @@ func Compile(d scene.Document) (scene.Compiled, error) {
 			if s.FillRule != "nonzero" && s.FillRule != "evenodd" {
 				return c, fmt.Errorf("invalid fill rule")
 			}
-			for _, v := range s.Transform {
-				if !finite(v) {
-					return c, fmt.Errorf("invalid transform")
-				}
-			}
-			inv, ok := s.Transform.Inverse()
-			if !ok {
-				return c, fmt.Errorf("singular transform")
-			}
-			for _, v := range inv {
-				if !finite(v) {
-					return c, fmt.Errorf("ill-conditioned transform")
-				}
+			inv, err := transform(s.Transform)
+			if err != nil {
+				return c, err
 			}
 			p, e := path(s.Path)
 			if e != nil {
@@ -167,6 +221,17 @@ func Compile(d scene.Document) (scene.Compiled, error) {
 			}
 			count(p)
 			cl.Shapes = append(cl.Shapes, scene.CompiledShape{Shape: s, Path: p, Inverse: inv})
+		}
+		for _, t := range l.Texts {
+			if err := add(t.ID); err != nil {
+				return c, err
+			}
+			cs, p, err := text(t, fonts)
+			if err != nil {
+				return c, err
+			}
+			count(p)
+			cl.Shapes = append(cl.Shapes, cs)
 		}
 		c.Layers = append(c.Layers, cl)
 	}
